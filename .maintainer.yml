@@ -1,0 +1,56 @@
+# maintainer config for arbox-bot
+# Generated from the existing scripts/audit.mjs + .github/workflows/daily-audit.yml setup.
+# This file is the source of truth; the audit script reads it on every run.
+
+archetype: stateful-service
+
+schedule: "0 7 * * *"  # 07:00 UTC = 10:00 Israel summer time
+quiet_hours: { start: "22:00", end: "07:00", tz: "Asia/Jerusalem" }
+weekly_clean_day: sun
+
+notification:
+  channel: telegram
+  target_secret: ADMIN_CHAT_ID
+  bot_token_secret: TELEGRAM_BOT_TOKEN
+  language: "he"
+
+state_sources:
+  - name: users
+    kind: cf-kv
+    namespace_id: e8d8d3a6e8904f4c9aa78522235be4c7
+    key_pattern: "users:*"
+  - name: rules
+    kind: cf-kv
+    namespace_id: e8d8d3a6e8904f4c9aa78522235be4c7
+    key_pattern: "rules:*"
+  - name: user_index
+    kind: cf-kv
+    namespace_id: e8d8d3a6e8904f4c9aa78522235be4c7
+    key: "index:users"
+
+upstream_probes:
+  - name: arbox
+    kind: http
+    auth: per-user                                       # credentials in users:<id>
+    endpoint: "https://apiappv2.arboxapp.com"
+    health_endpoint: "/api/v2/user/login"
+
+recovery_actions:
+  - name: book-missed-class
+    when: "race rule active, opens_at < now, !user_booked && !user_in_standby"
+    do: "POST /api/v2/scheduleStandBy/insert with user's active package id"
+  - name: notify-user-rule-config
+    when: "rule includes day with no classes (gym closed) OR rule time has no matching class"
+    do: "Send Telegram message to user in Hebrew; dedup 7d"
+
+code_authority: propose-pr
+dedup_window: 7d
+systemic_threshold: 2
+systemic_window: 7d
+
+# Persistence — the daily report is stored in KV so /lastaudit can replay it.
+last_report:
+  kind: cf-kv
+  namespace_id: e8d8d3a6e8904f4c9aa78522235be4c7
+  key: "audit:last_report"
+  timestamp_key: "audit:last_report_at"
