@@ -2232,94 +2232,6 @@ async function runRaceForUser(env, chatId, user, nowMs) {
   return out.length ? out : null;
 }
 
-// ponytail: daily self-audit. Walks every active race rule for the next 14 days,
-// detects classes that should have been booked but weren't, attempts to recover
-// (book / waitlist), and ships one report to the admin.
-async function auditUser(env, chatId, user) {
-  const rules = (await getRules(env, chatId)).filter(r => !r.paused && r.mode === 'race');
-  if (!rules.length) return null;
-
-  let ctx;
-  try { ctx = await arboxContext(user); }
-  catch (e) { return `<b>${escape(user.email)}</b>\n❌ Login failed: ${escape(e.message)}`; }
-
-  const today = dateInTz(new Date());
-  const horizon = dateInTz(new Date(Date.now() + HORIZON_DAYS * 86400000));
-  const items = await arboxScheduleRange(ctx, today, horizon);
-  const nowMs = Date.now();
-
-  const fixes = [], issues = [], onTrack = [];
-
-  for (const rule of rules) {
-    const knownHours = rule.openHoursBefore || rule.detectedHoursBefore || user.detectedHoursBefore;
-    if (!knownHours) continue;
-
-    for (const slot of ruleSlots(rule)) {
-      // Earliest matching future date whose window has already opened.
-      for (let d = 0; d < HORIZON_DAYS; d++) {
-        const date = dateInTz(new Date(nowMs + d * 86400000));
-        if (!rule.days.includes(weekdayShortInTz(date))) continue;
-        const classStartMs = israelDateTimeToUtcMs(date, slot.time);
-        if (classStartMs < nowMs) continue; // class already happened
-        const opensAtMs = classStartMs - knownHours * 3_600_000;
-        if (opensAtMs > nowMs) break; // window not open yet → nothing to audit further out
-
-        const klass = findClassByTime(items.filter(c => c.date === date), slot.time, slot.class);
-        const label = `${date} ${slot.time}`;
-        if (!klass) { issues.push(`⚠️ ${label} — gym hasn't published the class`); continue; }
-        const className = (klass.box_categories && klass.box_categories.name) || slot.class || '?';
-        if (klass.user_booked) { onTrack.push(`✓ ${label} ${className} — booked`); continue; }
-        if (klass.user_in_standby) { onTrack.push(`✓ ${label} ${className} — waitlist #${klass.stand_by_position || '?'}`); continue; }
-
-        // Missed — try to recover.
-        const useWaitlist = rule.waitlistIfFull !== false;
-        const res = await bookWithFallback(ctx, klass.id, useWaitlist);
-        if (res.ok) {
-          const tag = res.mode === 'waitlist' ? '📋 added to waitlist' : '🏁 booked';
-          fixes.push(`✅ ${label} ${className} — ${tag}`);
-        } else {
-          const m = (res.body && res.body.error && (res.body.error.messageToUser || res.body.error.message)) || `HTTP ${res.status}`;
-          issues.push(`❌ ${label} ${className} — could not recover: ${escape(m)}`);
-        }
-        break; // first missed instance per slot is enough; rest gets caught next day
-      }
-    }
-  }
-
-  if (!fixes.length && !issues.length && !onTrack.length) return null;
-  const lines = [`<b>${escape(user.email)}</b>`];
-  if (fixes.length) { lines.push('', '<b>Fixed:</b>', ...fixes); }
-  if (issues.length) { lines.push('', '<b>Issues:</b>', ...issues); }
-  if (!fixes.length && !issues.length) {
-    lines.push(`✅ ${onTrack.length} upcoming booking${onTrack.length === 1 ? '' : 's'} on track.`);
-  }
-  return lines.join('\n');
-}
-
-async function maybeRunDailyAudit(env) {
-  // Fire once per 23h. Gate via a single KV key so cron drift / restarts can't double-fire.
-  const lastMs = parseInt((await env.ARBOX_KV.get('audit:last_ms')) || '0', 10);
-  if (Date.now() - lastMs < 23 * 3_600_000) return;
-  await env.ARBOX_KV.put('audit:last_ms', String(Date.now()));
-
-  const acl = await getAcl(env);
-  const userIds = await listUserChatIds(env);
-  const sections = [];
-  for (const chatId of userIds) {
-    const user = await getUser(env, chatId);
-    if (!user) continue;
-    try {
-      const s = await auditUser(env, chatId, user);
-      if (s) sections.push(s);
-    } catch (e) {
-      sections.push(`<b>${escape(user.email || chatId)}</b>\n❌ Audit crashed: ${escape(e.message)}`);
-    }
-  }
-  const header = `<b>📊 Daily booking audit</b> — ${formatLocalIL(Date.now())} Israel`;
-  const body = sections.length ? sections.join('\n\n') : 'No active rules across any user.';
-  await send(env, acl.admin, `${header}\n\n${body}`);
-}
-
 async function runScheduled(env, scheduledTime) {
   const nowMs = Date.parse(scheduledTime) || Date.now();
   const userIds = await listUserChatIds(env);
@@ -2342,7 +2254,6 @@ async function runScheduled(env, scheduledTime) {
     if (summaries.length) await send(env, chatId, summaries.join('\n'));
     await runRemindersForUser(env, chatId, user, nowMs);
   }
-  await maybeRunDailyAudit(env);
 }
 
 // =============================================================================
