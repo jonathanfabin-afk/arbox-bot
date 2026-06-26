@@ -25,13 +25,19 @@ async function kvGet(key) {
   return await r.text();
 }
 
-async function tg(text) {
+async function tg(chatId, text) {
   const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: env.ADMIN_CHAT_ID, parse_mode: 'HTML', text }),
+    body: JSON.stringify({ chat_id: chatId, parse_mode: 'HTML', text }),
   });
-  if (!r.ok) console.error(`tg failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) console.error(`tg ${chatId} failed: ${r.status} ${await r.text()}`);
+}
+
+async function kvPut(key, value) {
+  await fetch(`${kvBase}/values/${encodeURIComponent(key)}`, {
+    method: 'PUT', headers: cfHeaders, body: value,
+  });
 }
 
 const esc = s => String(s == null ? '' : s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -140,6 +146,7 @@ async function bookWithFallback(ctx, scheduleId, useWaitlist) {
 async function auditUser(chatId) {
   const u = JSON.parse(await kvGet(`users:${chatId}`) || 'null');
   if (!u) return null;
+  u.chatId = chatId; // stamp it on so user-facing notifications can address them
   const rulesRaw = await kvGet(`rules:${chatId}`);
   const rules = (rulesRaw ? JSON.parse(rulesRaw) : []).filter(r => !r.paused && r.mode === 'race');
   if (!rules.length) return { user: u, onTrackCount: 0, fixes: [], issues: [] };
@@ -158,7 +165,18 @@ async function auditUser(chatId) {
   const items = await arboxSchedule(ctx, today, horizon);
   const nowMs = Date.now();
   const fixes = [], issues = [];
+  // Per-rule classification of "gym hasn't published" — collected to notify the
+  // affected user once (not the admin). Keyed by rule.id + classification kind.
+  const userRuleIssues = new Map(); // key = `${ruleId}|${kind}|${detail}` → human description
   let onTrack = 0;
+
+  function classifyMissing(date, slot) {
+    const dayItems = items.filter(c => c.date === date);
+    if (!dayItems.length) return 'closed';
+    const atTime = dayItems.filter(c => (c.time || '').startsWith(slot.time));
+    if (!atTime.length) return 'no-such-time';
+    return 'unpublished'; // class exists at the time but our filter didn't match — treat as noise
+  }
 
   for (const rule of rules) {
     const knownHours = rule.openHoursBefore || rule.detectedHoursBefore || u.detectedHoursBefore;
@@ -166,7 +184,8 @@ async function auditUser(chatId) {
     for (const slot of ruleSlots(rule)) {
       for (let d = 0; d < HORIZON_DAYS; d++) {
         const date = dateInTz(new Date(nowMs + d * 86400000));
-        if (!rule.days.includes(wdayInTz(date))) continue;
+        const wd = wdayInTz(date);
+        if (!rule.days.includes(wd)) continue;
         const classStartMs = israelDateTimeToUtcMs(date, slot.time);
         if (classStartMs < nowMs) continue;
         const opensAtMs = classStartMs - knownHours * 3_600_000;
@@ -174,7 +193,24 @@ async function auditUser(chatId) {
 
         const klass = findClassByTime(items.filter(c => c.date === date), slot.time, slot.class);
         const label = `${date} ${slot.time}`;
-        if (!klass) { issues.push(`⚠️ ${label} — gym hasn't published the class`); continue; }
+        if (!klass) {
+          const kind = classifyMissing(date, slot);
+          if (kind === 'closed') {
+            const key = `${rule.id}|closed|${wd}`;
+            if (!userRuleIssues.has(key)) {
+              userRuleIssues.set(key, `הכלל שלך כולל יום <b>${WEEKDAY_HE[wd]}</b>, אבל המכון סגור ביום זה (אין שיעורים בלוח).`);
+            }
+          } else if (kind === 'no-such-time') {
+            const key = `${rule.id}|no-such-time|${slot.time}`;
+            if (!userRuleIssues.has(key)) {
+              // Suggest the times the gym actually runs (any day in the horizon)
+              const allTimes = [...new Set(items.map(c => (c.time || '').slice(0, 5)).filter(Boolean))].sort();
+              userRuleIssues.set(key, `הכלל שלך מבקש שיעור בשעה <b>${slot.time}</b>, אבל המכון לא מריץ שיעור בשעה הזאת.\nהשעות הקיימות בלוח: ${allTimes.join(', ') || '(אין)'}`);
+            }
+          }
+          // 'unpublished' is silent — the gym just hasn't published this week's schedule yet
+          continue;
+        }
         const name = (klass.box_categories && klass.box_categories.name) || slot.class || '?';
         if (klass.user_booked) { onTrack++; continue; }
         if (klass.user_in_standby) { onTrack++; continue; }
@@ -192,8 +228,24 @@ async function auditUser(chatId) {
       }
     }
   }
-  return { user: u, onTrackCount: onTrack, fixes, issues };
+
+  // Notify the affected user about rule-config issues (debounced 7 days).
+  let userNotified = false;
+  if (userRuleIssues.size > 0) {
+    const lastMs = parseInt((await kvGet(`audit:notified:${u.chatId || ''}`)) || '0', 10);
+    if (Date.now() - lastMs > 7 * 86400000) {
+      const lines = ['⚠️ <b>בעיות בכלל הרישום האוטומטי שלך</b>', '', 'יש משהו בכלל שלא מסתדר עם הלוח של המכון:', ''];
+      for (const msg of userRuleIssues.values()) lines.push(`• ${msg}`, '');
+      lines.push('בקש /recurring בבוט כדי לערוך או למחוק את הכלל הבעייתי.');
+      try { await tg(u.chatId, lines.join('\n')); userNotified = true; await kvPut(`audit:notified:${u.chatId}`, String(Date.now())); } catch {}
+    } else {
+      userNotified = 'debounced';
+    }
+  }
+  return { user: u, onTrackCount: onTrack, fixes, issues, userRuleIssueCount: userRuleIssues.size, userNotified };
 }
+
+const WEEKDAY_HE = { sun: 'ראשון', mon: 'שני', tue: 'שלישי', wed: 'רביעי', thu: 'חמישי', fri: 'שישי', sat: 'שבת' };
 
 (async () => {
   const idxRaw = await kvGet('index:users');
@@ -206,11 +258,6 @@ async function auditUser(chatId) {
 
   const anyAction = reports.some(r => r.fixes.length > 0 || r.issues.length > 0);
   const isSunday = wdayInTz(dateInTz(new Date())) === 'sun';
-  const send = anyAction || isSunday;
-
-  console.log(JSON.stringify({ anyAction, isSunday, send, reports }, null, 2));
-
-  if (!send) { console.log('Clean weekday run — staying silent.'); return; }
 
   const stamp = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
   const header = anyAction ? `📊 Audit — ${stamp} Israel` : `✅ Weekly audit — ${stamp} Israel`;
@@ -218,8 +265,19 @@ async function auditUser(chatId) {
     const lines = [`<b>${esc(r.user.email || '?')}</b>`];
     if (r.fixes.length) lines.push('', ...r.fixes);
     if (r.issues.length) lines.push('', ...r.issues);
-    if (!r.fixes.length && !r.issues.length) lines.push(`✓ ${r.onTrackCount} upcoming booking${r.onTrackCount === 1 ? '' : 's'} on track`);
+    if (r.userRuleIssueCount > 0) {
+      const tag = r.userNotified === 'debounced' ? 'already notified <7d ago' : (r.userNotified ? 'notified user' : 'notification failed');
+      lines.push('', `ℹ️ ${r.userRuleIssueCount} rule-config issue${r.userRuleIssueCount === 1 ? '' : 's'} — ${tag}`);
+    }
+    if (!r.fixes.length && !r.issues.length && !r.userRuleIssueCount) lines.push(`✓ ${r.onTrackCount} upcoming booking${r.onTrackCount === 1 ? '' : 's'} on track`);
     return lines.join('\n');
   });
-  await tg(`${header}\n\n${sections.join('\n\n')}`);
+  const fullReport = `${header}\n\n${sections.join('\n\n')}`;
+  // Always persist the most recent report so /lastaudit in the bot can fetch it.
+  await kvPut('audit:last_report', fullReport);
+  await kvPut('audit:last_report_at', String(Date.now()));
+
+  console.log(JSON.stringify({ anyAction, isSunday, send: anyAction || isSunday, reports }, null, 2));
+  if (!(anyAction || isSunday)) { console.log('Clean weekday run — staying silent.'); return; }
+  await tg(env.ADMIN_CHAT_ID, fullReport);
 })().catch(e => { console.error('audit failed:', e); process.exit(1); });

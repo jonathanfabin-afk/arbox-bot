@@ -427,6 +427,7 @@ const HELP_LOGGED_IN = [
   '/recurring remove &lt;n&gt; / pause &lt;n&gt; / resume &lt;n&gt;',
   '',
   '/window — show how many hours before class registration opens',
+  '/lastaudit — (admin only) replay the most recent daily audit report',
   '/whoami — show logged-in account',
   '/logout — forget my credentials',
   '/help — this message',
@@ -1409,6 +1410,17 @@ async function cmdLogout(env, chatId) {
   await send(env, chatId, '🗑 Forgot your credentials. Send /start to set up again.');
 }
 
+// Admin-only: replay the most recent audit report (written by the GitHub Actions job).
+async function cmdLastAudit(env, chatId) {
+  const acl = await getAcl(env);
+  if (!isAdmin(acl, chatId)) return send(env, chatId, 'Admin only.');
+  const report = await env.ARBOX_KV.get('audit:last_report');
+  if (!report) return send(env, chatId, 'No audit report stored yet. The first one runs daily at 10:00 IDT.');
+  const atMs = parseInt((await env.ARBOX_KV.get('audit:last_report_at')) || '0', 10);
+  const age = atMs ? `\n<i>(stored ${formatLocalIL(atMs)} Israel time)</i>` : '';
+  await send(env, chatId, report + age);
+}
+
 // =============================================================================
 // Callback queries (inline button handlers)
 // =============================================================================
@@ -1864,6 +1876,7 @@ async function handleUpdate(env, update) {
         case '/grab': return startGrabWizard(env, chatId, user);
         case '/watches': return cmdWatches(env, chatId, user);
         case '/window': return cmdWindow(env, chatId, user);
+        case '/lastaudit': return cmdLastAudit(env, chatId);
         default: return send(env, chatId, `Unknown command: ${escape(cmd)}. Try /help.`);
       }
     } catch (e) {
