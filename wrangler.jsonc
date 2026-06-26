@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "arbox-bot",
+  "account_id": "fa8695fd7fb0ed3455a020f52493b2e1",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-12-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "kv_namespaces": [
+    { "binding": "ARBOX_KV", "id": "e8d8d3a6e8904f4c9aa78522235be4c7" }
+  ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
