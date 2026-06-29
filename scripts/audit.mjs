@@ -266,7 +266,7 @@ const WEEKDAY_HE = { sun: 'ראשון', mon: 'שני', tue: 'שלישי', wed: '
     if (r.fixes.length) lines.push('', ...r.fixes);
     if (r.issues.length) lines.push('', ...r.issues);
     if (r.userRuleIssueCount > 0) {
-      const tag = r.userNotified === 'debounced' ? 'already notified <7d ago' : (r.userNotified ? 'notified user' : 'notification failed');
+      const tag = r.userNotified === 'debounced' ? 'already notified within 7 days' : (r.userNotified ? 'notified user' : 'notification failed');
       lines.push('', `ℹ️ ${r.userRuleIssueCount} rule-config issue${r.userRuleIssueCount === 1 ? '' : 's'} — ${tag}`);
     }
     if (!r.fixes.length && !r.issues.length && !r.userRuleIssueCount) lines.push(`✓ ${r.onTrackCount} upcoming booking${r.onTrackCount === 1 ? '' : 's'} on track`);
