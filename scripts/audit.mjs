@@ -213,7 +213,13 @@ async function auditUser(chatId) {
         }
         const name = (klass.box_categories && klass.box_categories.name) || slot.class || '?';
         if (klass.user_booked) { onTrack++; continue; }
-        if (klass.user_in_standby) { onTrack++; continue; }
+        if (klass.user_in_standby) {
+          // Waitlist is a race FAILURE, not a success. The bot's whole point is
+          // to win the race. Flag it as an issue so the admin sees it.
+          const cap = `${klass.registered ?? '?'}/${klass.series?.max_users ?? klass.max_users ?? '?'}`;
+          issues.push(`⚠️ ${label} ${name} — RACE LOST · waitlist #${klass.stand_by_position ?? '?'} · class ${cap}`);
+          continue;
+        }
 
         const useWaitlist = rule.waitlistIfFull !== false;
         const res = await bookWithFallback(ctx, klass.id, useWaitlist);
