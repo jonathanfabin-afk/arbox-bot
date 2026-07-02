@@ -225,12 +225,21 @@ async function arboxCancel(ctx, scheduleUserId, scheduleId) {
 // Caller is responsible for falling back to arboxBookOrWaitlist if this returns
 // a "class full"-style error and the user wanted waitlist.
 async function burstFire(ctx, scheduleId, opensAtMs) {
-  const offsets = [-150, -75, 0, 75, 150]; // ms relative to opensAtMs
+  // 3 offsets in a tight ±25ms window. Was 5×±150ms — the wider spread
+  // triggered Arbox's per-user rate limit (429s), causing us to lose races
+  // we should have won. 3 requests give network-jitter tolerance without
+  // burning the rate quota.
+  const offsets = [-25, 0, 25]; // ms relative to opensAtMs
   const reqs = offsets.map(off => {
     const fireAt = opensAtMs + off;
     const wait = Math.max(0, fireAt - Date.now());
     return new Promise(r => setTimeout(r, wait))
-      .then(() => arboxBook(ctx, scheduleId))
+      .then(async () => {
+        const t0 = Date.now();
+        const r = await arboxBook(ctx, scheduleId);
+        console.log(`[burst off=${off}ms] sid=${scheduleId} → HTTP ${r.status} mode=${r.mode} latency=${Date.now() - t0}ms`);
+        return r;
+      })
       .catch(e => ({ ok: false, status: 0, text: e.message, body: null, mode: 'error' }));
   });
   const results = await Promise.all(reqs);
