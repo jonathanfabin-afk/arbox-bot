@@ -160,6 +160,26 @@ async function arboxContext(user) {
   };
 }
 
+// Cache Arbox auth context in KV so subsequent race attempts skip the ~500ms
+// cold login. Tokens are cached for 15 minutes; on cache miss we fall back to
+// a cold arboxContext() call and save the result.
+async function cachedArboxContext(env, chatId, user) {
+  const key = `authcache:${chatId}`;
+  try {
+    const raw = await env.ARBOX_KV.get(key);
+    if (raw) {
+      const cached = JSON.parse(raw);
+      if (cached.expiresAt > Date.now() && cached.email === user.email) {
+        return { ...cached.ctx, _fromCache: true };
+      }
+    }
+  } catch {}
+  const ctx = await arboxContext(user);
+  const payload = { ctx, email: user.email, expiresAt: Date.now() + 15 * 60 * 1000 };
+  try { await env.ARBOX_KV.put(key, JSON.stringify(payload)); } catch {}
+  return ctx;
+}
+
 async function arboxSchedule(ctx, dateStr) {
   const iso = `${dateStr}T00:00:00.000Z`;
   const r = await fetch(`${ARBOX_BASE}/api/v2/schedule/betweenDates`, {
@@ -2151,7 +2171,7 @@ async function runRaceForUser(env, chatId, user, nowMs) {
   if (!candidates.length) return null;
 
   let ctx;
-  try { ctx = await arboxContext(user); }
+  try { ctx = await cachedArboxContext(env, chatId, user); }
   catch (e) { return [`❌ ${user.email}: race login failed — ${e.message}`]; }
 
   // Re-load rules so we can both write back the detected window AND track which
