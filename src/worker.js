@@ -660,13 +660,21 @@ async function cmdUpcoming(env, chatId, user) {
   await send(env, chatId, lines.join('\n'));
 }
 
+function classWithAttendees(c) {
+  const booked = (c.schedule_user || c.booked_users || [])
+    .map(u => u.full_name || `${u.first_name || ''} ${u.last_name || ''}`.trim())
+    .filter(Boolean);
+  const attendees = booked.length ? '\n' + booked.map(n => `    · ${escape(n)}`).join('\n') : '';
+  return '• ' + classOneLine(c) + attendees;
+}
+
 async function cmdToday(env, chatId, user) {
   const ctx = await arboxContext(user);
   const today = dateInTz(new Date());
   const items = await arboxSchedule(ctx, today);
   if (!items.length) return send(env, chatId, `No classes today (${today}).`);
   const lines = [`<b>Today's schedule (${today})</b>`, ''];
-  for (const c of items) lines.push('• ' + classOneLine(c));
+  for (const c of items) lines.push(classWithAttendees(c), '');
   await send(env, chatId, lines.join('\n'));
 }
 
@@ -678,7 +686,7 @@ async function cmdSchedule(env, chatId, user, args) {
   const items = await arboxSchedule(ctx, date);
   if (!items.length) return send(env, chatId, `No classes on ${date}.`);
   const lines = [`<b>Schedule for ${date}</b>`, ''];
-  for (const c of items) lines.push('• ' + classOneLine(c));
+  for (const c of items) lines.push(classWithAttendees(c), '');
   await send(env, chatId, lines.join('\n'));
 }
 
