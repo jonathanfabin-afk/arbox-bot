@@ -283,7 +283,8 @@ const WEEKDAY_HE = { sun: 'ראשון', mon: 'שני', tue: 'שלישי', wed: '
   await kvPut('audit:last_report', fullReport);
   await kvPut('audit:last_report_at', String(Date.now()));
 
-  console.log(JSON.stringify({ anyAction, isSunday, send: anyAction || isSunday, reports }, null, 2));
+  const redactedReports = reports.map(r => ({ ...r, user: { ...r.user, password: '[REDACTED]' } }));
+  console.log(JSON.stringify({ anyAction, isSunday, send: anyAction || isSunday, reports: redactedReports }, null, 2));
   if (!(anyAction || isSunday)) { console.log('Clean weekday run — staying silent.'); return; }
   await tg(env.ADMIN_CHAT_ID, fullReport);
 })().catch(e => { console.error('audit failed:', e); process.exit(1); });
