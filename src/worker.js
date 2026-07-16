@@ -2324,6 +2324,65 @@ async function runRaceForUser(env, chatId, user, nowMs) {
   return out.length ? out : null;
 }
 
+// Watch for waitlist position changes and promotions. Fires every cron tick per
+// user. Fetches the upcoming schedule, diffs against last known WL positions in
+// KV, and notifies the user when:
+//   - they moved up (with an encouragement tuned to how close they are)
+//   - they got promoted from WL to booked (celebration + race position)
+// Silent on drops or new-appearances-first-sight to avoid noise.
+async function runWaitlistWatchForUser(env, chatId, user) {
+  const stateKey = `wlwatch:${chatId}`;
+  const prevRaw = await env.ARBOX_KV.get(stateKey);
+  const prev = prevRaw ? JSON.parse(prevRaw) : {};
+
+  let ctx;
+  try { ctx = await cachedArboxContext(env, chatId, user); }
+  catch { return; }
+
+  const today = dateInTz(new Date());
+  const horizon = dateInTz(new Date(Date.now() + HORIZON_DAYS * 86400000));
+  let items;
+  try { items = await arboxScheduleRange(ctx, today, horizon); }
+  catch { return; }
+
+  const next = {};
+  const notifications = [];
+
+  for (const c of items) {
+    if (!c.user_in_standby && !c.user_booked) continue;
+    const key = String(c.id);
+    const name = (c.box_categories && c.box_categories.name) || '?';
+    const label = `${c.date} ${c.time} — ${name}`;
+    const prevEntry = prev[key];
+
+    if (c.user_booked) {
+      if (prevEntry && prevEntry.wl) {
+        // Promotion from waitlist to booked.
+        const rp = racePosition(c);
+        const posTag = rp ? ` (position #${rp.pos}/${rp.of})` : '';
+        notifications.push(`🎉 <b>You're in!</b>\n${escape(label)}\nPromoted from waitlist${posTag}. See you there.`);
+      }
+      next[key] = { booked: true };
+    } else if (c.user_in_standby) {
+      const pos = c.stand_by_position;
+      if (prevEntry && prevEntry.wl && typeof prevEntry.pos === 'number' && typeof pos === 'number' && pos < prevEntry.pos) {
+        const cheer = pos === 1 ? '👀 Next in line — one cancellation and you\'re in!'
+          : pos <= 2 ? '🔥 Almost there, just a little more!'
+          : pos <= 5 ? '📈 Moving up nicely!'
+          : '⬆️ Position improved.';
+        notifications.push(`📋 <b>Waitlist update</b>\n${escape(label)}\n#${prevEntry.pos} → <b>#${pos}</b>\n${cheer}`);
+      }
+      next[key] = { wl: true, pos };
+    }
+  }
+
+  await env.ARBOX_KV.put(stateKey, JSON.stringify(next));
+
+  for (const msg of notifications) {
+    try { await send(env, chatId, msg); } catch {}
+  }
+}
+
 async function runScheduled(env, scheduledTime) {
   const nowMs = Date.parse(scheduledTime) || Date.now();
   const userIds = await listUserChatIds(env);
@@ -2345,6 +2404,7 @@ async function runScheduled(env, scheduledTime) {
     if (r3) summaries.push(...r3);
     if (summaries.length) await send(env, chatId, summaries.join('\n'));
     await runRemindersForUser(env, chatId, user, nowMs);
+    try { await runWaitlistWatchForUser(env, chatId, user); } catch (e) { console.log(`wlwatch error for ${chatId}:`, e.message); }
   }
 }
 
