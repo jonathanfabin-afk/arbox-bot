@@ -786,6 +786,12 @@ async function cmdBook(env, chatId, user, args) {
       ? `📋 Joined waitlist (position #${updated.stand_by_position || '?'}).`
       : `✅ Booked${posTag}.`;
     await send(env, chatId, heading + '\n\n' + classFullDetail(updated, date));
+    if (res.mode === 'waitlist') {
+      try {
+        const classStartMs = israelDateTimeToUtcMs(date, time);
+        await seedWlWatchEntry(env, chatId, updated, date, classStartMs);
+      } catch {}
+    }
     if (res.mode === 'book') {
       try { await scheduleFlairReminder(env, chatId, updated, date); } catch {}
     }
@@ -2068,6 +2074,9 @@ async function runWatchesForUser(env, chatId, user, nowMs) {
       const posTag = rp ? ` — #${rp.pos}/${rp.of}` : '';
       out.push(`${tag} ${w.date} ${w.time} ${name}${posTag}`);
       changed = true;
+      if (res.mode === 'waitlist' && fresh) {
+        try { await seedWlWatchEntry(env, chatId, fresh, w.date, classStartMs); } catch {}
+      }
       try {
         const forReminder = fresh || klass;
         const fakeRule = { reminderHours: w.reminderHours, time: w.time, class: w.class };
@@ -2299,6 +2308,9 @@ async function runRaceForUser(env, chatId, user, nowMs) {
       const posTag = rp ? ` — #${rp.pos}/${rp.of}` : '';
       out.push(`${successMode === 'waitlist' ? '📋 [race] WAITLISTED' : '🏁 [race] BOOKED'} ${cand.date} ${cand.slot.time} ${name}${posTag}`);
       markReported();
+      if (successMode === 'waitlist' && fresh) {
+        try { await seedWlWatchEntry(env, chatId, fresh, cand.date, cand.classStartMs); } catch {}
+      }
       // Auto-detect window write-back.
       const detected = Math.round(((cand.classStartMs - Date.now()) / 3_600_000) * 10) / 10;
       if (ruleObj && !ruleObj.openHoursBefore) {
@@ -2324,59 +2336,80 @@ async function runRaceForUser(env, chatId, user, nowMs) {
   return out.length ? out : null;
 }
 
-// Watch for waitlist position changes and promotions. Fires every cron tick per
-// user. Fetches the upcoming schedule, diffs against last known WL positions in
-// KV, and notifies the user when:
-//   - they moved up (with an encouragement tuned to how close they are)
-//   - they got promoted from WL to booked (celebration + race position)
-// Silent on drops or new-appearances-first-sight to avoid noise.
+// Watch for waitlist position changes and promotions.
+// Gated to the final 2 hours before class start — that's the window where
+// cancellations actually happen and WL positions move. Outside that window we
+// skip the Arbox fetch entirely to preserve KV write quota and API budget.
+// State entries are seeded by the race/watch/book flows when they end in WL.
+const WL_WATCH_WINDOW_MS = 2 * 3_600_000;
+function wlWatchStateKey(chatId) { return `wlwatch:${chatId}`; }
+async function seedWlWatchEntry(env, chatId, klass, dateStr, classStartMs) {
+  const key = wlWatchStateKey(chatId);
+  const raw = await env.ARBOX_KV.get(key);
+  const state = raw ? JSON.parse(raw) : {};
+  state[String(klass.id)] = { wl: true, pos: klass.stand_by_position ?? null, classStartMs, date: dateStr };
+  await env.ARBOX_KV.put(key, JSON.stringify(state));
+}
 async function runWaitlistWatchForUser(env, chatId, user) {
-  const stateKey = `wlwatch:${chatId}`;
+  const stateKey = wlWatchStateKey(chatId);
   const prevRaw = await env.ARBOX_KV.get(stateKey);
-  const prev = prevRaw ? JSON.parse(prevRaw) : {};
+  if (!prevRaw) return; // no known WL entries → nothing to poll
+  const prev = JSON.parse(prevRaw);
+
+  const now = Date.now();
+  const active = Object.entries(prev).filter(([, e]) => e.classStartMs && e.classStartMs > now && (e.classStartMs - now) <= WL_WATCH_WINDOW_MS);
+  // Prune entries whose class already passed.
+  const pruned = Object.fromEntries(Object.entries(prev).filter(([, e]) => !e.classStartMs || e.classStartMs > now));
+  const prunedChanged = Object.keys(pruned).length !== Object.keys(prev).length;
+
+  if (!active.length) {
+    if (prunedChanged) await env.ARBOX_KV.put(stateKey, JSON.stringify(pruned));
+    return; // no class within the 2h window → skip the Arbox fetch
+  }
 
   let ctx;
   try { ctx = await cachedArboxContext(env, chatId, user); }
   catch { return; }
 
-  const today = dateInTz(new Date());
-  const horizon = dateInTz(new Date(Date.now() + HORIZON_DAYS * 86400000));
-  let items;
-  try { items = await arboxScheduleRange(ctx, today, horizon); }
-  catch { return; }
+  // Only fetch dates that have an active WL entry (usually 1-2 dates, often just today).
+  const dates = [...new Set(active.map(([, e]) => e.date).filter(Boolean))];
+  let items = [];
+  for (const d of dates) {
+    try { items = items.concat(await arboxSchedule(ctx, d)); }
+    catch {}
+  }
 
-  const next = {};
+  const next = { ...pruned };
   const notifications = [];
 
-  for (const c of items) {
-    if (!c.user_in_standby && !c.user_booked) continue;
-    const key = String(c.id);
+  for (const [key, prevEntry] of active) {
+    const c = items.find(x => String(x.id) === key);
+    if (!c) continue;
     const name = (c.box_categories && c.box_categories.name) || '?';
     const label = `${c.date} ${c.time} — ${name}`;
-    const prevEntry = prev[key];
 
     if (c.user_booked) {
-      if (prevEntry && prevEntry.wl) {
-        // Promotion from waitlist to booked.
-        const rp = racePosition(c);
-        const posTag = rp ? ` (position #${rp.pos}/${rp.of})` : '';
-        notifications.push(`🎉 <b>You're in!</b>\n${escape(label)}\nPromoted from waitlist${posTag}. See you there.`);
-      }
-      next[key] = { booked: true };
+      const rp = racePosition(c);
+      const posTag = rp ? ` (position #${rp.pos}/${rp.of})` : '';
+      notifications.push(`🎉 <b>You're in!</b>\n${escape(label)}\nPromoted from waitlist${posTag}. See you there.`);
+      next[key] = { booked: true, classStartMs: prevEntry.classStartMs };
     } else if (c.user_in_standby) {
       const pos = c.stand_by_position;
-      if (prevEntry && prevEntry.wl && typeof prevEntry.pos === 'number' && typeof pos === 'number' && pos < prevEntry.pos) {
+      if (typeof prevEntry.pos === 'number' && typeof pos === 'number' && pos < prevEntry.pos) {
         const cheer = pos === 1 ? '👀 Next in line — one cancellation and you\'re in!'
           : pos <= 2 ? '🔥 Almost there, just a little more!'
           : pos <= 5 ? '📈 Moving up nicely!'
           : '⬆️ Position improved.';
         notifications.push(`📋 <b>Waitlist update</b>\n${escape(label)}\n#${prevEntry.pos} → <b>#${pos}</b>\n${cheer}`);
       }
-      next[key] = { wl: true, pos };
+      next[key] = { wl: true, pos, classStartMs: prevEntry.classStartMs, date: prevEntry.date };
     }
   }
 
-  await env.ARBOX_KV.put(stateKey, JSON.stringify(next));
+  // Only write if state actually differs — avoids burning KV writes on no-ops.
+  if (JSON.stringify(next) !== JSON.stringify(prev)) {
+    await env.ARBOX_KV.put(stateKey, JSON.stringify(next));
+  }
 
   for (const msg of notifications) {
     try { await send(env, chatId, msg); } catch {}
