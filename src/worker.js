@@ -393,6 +393,16 @@ function findClassByTime(schedule, time, classNameSubstr) {
   return matches[0] || null;
 }
 
+// Where our booking ranks vs everyone else in the class (1 = first to register).
+// Sorted by schedule_user_id ascending — Arbox's global monotonic booking id.
+// Returns null if we're not booked or the roster isn't in the payload.
+function racePosition(c) {
+  if (!c.user_booked || !Array.isArray(c.booked_users) || !c.booked_users.length) return null;
+  const sorted = [...c.booked_users].sort((a, b) => (a.schedule_user_id || 0) - (b.schedule_user_id || 0));
+  const idx = sorted.findIndex(u => u.schedule_user_id === c.user_booked);
+  return idx >= 0 ? { pos: idx + 1, of: sorted.length } : null;
+}
+
 function classOneLine(c) {
   const name = (c.box_categories && c.box_categories.name) || '?';
   const time = c.time || '?';
@@ -401,7 +411,11 @@ function classOneLine(c) {
   const standby = c.stand_by ?? 0;
   const coach = c.coach ? `${c.coach.first_name || ''} ${c.coach.last_name || ''}`.trim() : '';
   let mark = '';
-  if (c.user_booked) mark = '  <i>(you ✅)</i>';
+  if (c.user_booked) {
+    const rp = racePosition(c);
+    const posTag = rp ? ` #${rp.pos}/${rp.of}` : '';
+    mark = `  <i>(you ✅${posTag})</i>`;
+  }
   else if (c.user_in_standby) mark = `  <i>(you 📋 wl#${c.stand_by_position || '?'})</i>`;
   return `${time} <b>${escape(name)}</b> ${reg}/${max}${standby ? ` +${standby}wl` : ''}${coach ? ` · ${escape(coach)}` : ''}${mark}`;
 }
@@ -659,7 +673,12 @@ async function cmdNext(env, chatId, user) {
   const mine = items.filter(c => c.user_booked || c.user_in_standby).sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`));
   if (!mine.length) return send(env, chatId, 'No upcoming bookings or waitlist entries.');
   const c = mine[0];
-  const heading = c.user_in_standby ? `📋 <b>On waitlist</b> (position #${c.stand_by_position || '?'})\n\n` : '';
+  let heading = '';
+  if (c.user_in_standby) heading = `📋 <b>On waitlist</b> (position #${c.stand_by_position || '?'})\n\n`;
+  else if (c.user_booked) {
+    const rp = racePosition(c);
+    if (rp) heading = `✅ <b>Booked</b> (race position #${rp.pos}/${rp.of})\n\n`;
+  }
   await send(env, chatId, heading + classFullDetail(c, c.date));
 }
 
@@ -674,7 +693,13 @@ async function cmdUpcoming(env, chatId, user) {
   for (const c of mine) {
     const name = (c.box_categories && c.box_categories.name) || '?';
     const coach = c.coach ? ` · ${escape(c.coach.first_name || '')} ${escape(c.coach.last_name || '')}` : '';
-    const tag = c.user_booked ? '✅' : `📋wl#${c.stand_by_position || '?'}`;
+    let tag;
+    if (c.user_booked) {
+      const rp = racePosition(c);
+      tag = rp ? `✅#${rp.pos}/${rp.of}` : '✅';
+    } else {
+      tag = `📋wl#${c.stand_by_position || '?'}`;
+    }
     lines.push(`• ${tag} ${c.date} ${c.time} — ${escape(name)}${coach}`);
   }
   await send(env, chatId, lines.join('\n'));
@@ -755,9 +780,11 @@ async function cmdBook(env, chatId, user, args) {
   if (res.ok) {
     const refreshed = await arboxSchedule(ctx, date);
     const updated = refreshed.find(c => c.id === klass.id) || klass;
+    const rp = res.mode === 'book' ? racePosition(updated) : null;
+    const posTag = rp ? ` (position #${rp.pos}/${rp.of})` : '';
     const heading = res.mode === 'waitlist'
       ? `📋 Joined waitlist (position #${updated.stand_by_position || '?'}).`
-      : '✅ Booked.';
+      : `✅ Booked${posTag}.`;
     await send(env, chatId, heading + '\n\n' + classFullDetail(updated, date));
     if (res.mode === 'book') {
       try { await scheduleFlairReminder(env, chatId, updated, date); } catch {}
@@ -2031,15 +2058,21 @@ async function runWatchesForUser(env, chatId, user, nowMs) {
     }
     if (res.ok) {
       const tag = res.mode === 'waitlist' ? '📋 WAITLISTED' : '🏁 BOOKED';
-      out.push(`${tag} ${w.date} ${w.time} ${name}`);
-      changed = true;
-      // Schedule reminder + record detected window if not yet known.
+      // Re-fetch to get roster for race position + drive reminders.
+      let fresh = null;
       try {
         const refreshed = await arboxSchedule(ctx, w.date);
-        const fresh = refreshed.find(c => c.id === klass.id) || klass;
+        fresh = refreshed.find(c => c.id === klass.id) || null;
+      } catch {}
+      const rp = res.mode === 'book' && fresh ? racePosition(fresh) : null;
+      const posTag = rp ? ` — #${rp.pos}/${rp.of}` : '';
+      out.push(`${tag} ${w.date} ${w.time} ${name}${posTag}`);
+      changed = true;
+      try {
+        const forReminder = fresh || klass;
         const fakeRule = { reminderHours: w.reminderHours, time: w.time, class: w.class };
-        await maybeScheduleReminder(env, chatId, fakeRule, fresh, w.date);
-        if (res.mode === 'book') await scheduleFlairReminder(env, chatId, fresh, w.date);
+        await maybeScheduleReminder(env, chatId, fakeRule, forReminder, w.date);
+        if (res.mode === 'book') await scheduleFlairReminder(env, chatId, forReminder, w.date);
       } catch {}
       if (!user.detectedHoursBefore) {
         const detected = Math.round(((classStartMs - nowMs) / 3_600_000) * 10) / 10;
@@ -2254,7 +2287,17 @@ async function runRaceForUser(env, chatId, user, nowMs) {
 
     if (res.ok) {
       const successMode = res.mode || 'book';
-      out.push(`${successMode === 'waitlist' ? '📋 [race] WAITLISTED' : '🏁 [race] BOOKED'} ${cand.date} ${cand.slot.time} ${name}`);
+      // Re-fetch the class so we can show race position (need booked_users roster)
+      // and drive the reminders. If refetch fails we still emit a message, just
+      // without position info.
+      let fresh = null;
+      try {
+        const refreshed = await arboxSchedule(ctx, cand.date);
+        fresh = refreshed.find(c => c.id === klass.id) || null;
+      } catch {}
+      const rp = successMode === 'book' && fresh ? racePosition(fresh) : null;
+      const posTag = rp ? ` — #${rp.pos}/${rp.of}` : '';
+      out.push(`${successMode === 'waitlist' ? '📋 [race] WAITLISTED' : '🏁 [race] BOOKED'} ${cand.date} ${cand.slot.time} ${name}${posTag}`);
       markReported();
       // Auto-detect window write-back.
       const detected = Math.round(((cand.classStartMs - Date.now()) / 3_600_000) * 10) / 10;
@@ -2263,10 +2306,9 @@ async function runRaceForUser(env, chatId, user, nowMs) {
         rulesChanged = true;
       }
       try {
-        const refreshed = await arboxSchedule(ctx, cand.date);
-        const fresh = refreshed.find(c => c.id === klass.id) || klass;
-        await maybeScheduleReminder(env, chatId, { ...cand.rule, time: cand.slot.time, class: cand.slot.class }, fresh, cand.date);
-        if (res.mode === 'book') await scheduleFlairReminder(env, chatId, fresh, cand.date);
+        const forReminder = fresh || klass;
+        await maybeScheduleReminder(env, chatId, { ...cand.rule, time: cand.slot.time, class: cand.slot.class }, forReminder, cand.date);
+        if (res.mode === 'book') await scheduleFlairReminder(env, chatId, forReminder, cand.date);
       } catch {}
     } else if (!isNotYetOpen(res)) {
       // Real failure — emit only at end of catch-up window so we don't spam each minute.
