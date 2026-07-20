@@ -3,3 +3,6 @@ node_modules/
 *.log
 .env
 .DS_Store
+local-runner/.env
+local-runner/node_modules/
+local-runner/run.log

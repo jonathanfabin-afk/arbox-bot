@@ -1,0 +1,16 @@
+{
+  "name": "arbox-bot-local-runner",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Israel-local race runner — beats CF Frankfurt latency by firing from the user's own laptop",
+  "main": "race-runner.mjs",
+  "scripts": {
+    "start": "node race-runner.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
