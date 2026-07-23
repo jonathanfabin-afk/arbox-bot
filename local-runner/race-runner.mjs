@@ -16,6 +16,18 @@
 
 import 'dotenv/config';
 
+// Refuse to die on transient errors. Race fires depend on this process staying
+// alive for days at a time; a single uncaught rejection from a flaky network
+// call must not take the whole thing down.
+process.on('uncaughtException', (e) => {
+  console.error(new Date().toISOString(), 'uncaughtException:', e.message, e.stack);
+});
+process.on('unhandledRejection', (r) => {
+  console.error(new Date().toISOString(), 'unhandledRejection:', r?.message || r);
+});
+// Heartbeat so we can tell in the log if the process ever went silent.
+setInterval(() => console.log(new Date().toISOString(), 'heartbeat', 'rss=' + Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB'), 5 * 60 * 1000);
+
 const NS = 'e8d8d3a6e8904f4c9aa78522235be4c7';
 const ARBOX = 'https://apiappv2.arboxapp.com';
 const TZ = 'Asia/Jerusalem';
