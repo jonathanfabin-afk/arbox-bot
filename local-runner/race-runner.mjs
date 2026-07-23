@@ -15,6 +15,31 @@
 // never blocks on a cold login.
 
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+
+// Single-instance guard. Task Scheduler's IgnoreNew doesn't work when the
+// scheduled task is a launcher that exits immediately (wscript forks cmd/node
+// and returns — TS thinks the task completed and re-fires the trigger). Without
+// this check we'd spawn a new node process every repetition tick and end up
+// with N concurrent runners eating RAM. Lockfile pattern is bulletproof.
+const LOCK_FILE = path.resolve(process.cwd(), 'race-runner.lock');
+function isPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+if (fs.existsSync(LOCK_FILE)) {
+  const other = parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10);
+  if (Number.isFinite(other) && other !== process.pid && isPidAlive(other)) {
+    console.log(new Date().toISOString(), `another instance is running (pid=${other}). Exiting.`);
+    process.exit(0); // Exit 0 so run.bat doesn't restart in a tight loop.
+  }
+  // Stale lock — previous instance died without cleanup. Take over.
+}
+fs.writeFileSync(LOCK_FILE, String(process.pid));
+const cleanupLock = () => { try { fs.unlinkSync(LOCK_FILE); } catch {} };
+process.on('exit', cleanupLock);
+process.on('SIGINT', () => { cleanupLock(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupLock(); process.exit(0); });
 
 // Refuse to die on transient errors. Race fires depend on this process staying
 // alive for days at a time; a single uncaught rejection from a flaky network

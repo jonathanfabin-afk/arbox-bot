@@ -6,3 +6,4 @@ node_modules/
 local-runner/.env
 local-runner/node_modules/
 local-runner/run.log
+local-runner/race-runner.lock
