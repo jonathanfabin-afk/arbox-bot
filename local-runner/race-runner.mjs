@@ -17,6 +17,19 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+// Keep TCP+TLS connections to Arbox warm for a long time. Node's default
+// undici pool times out idle connections at 4s — meaning our first request
+// after 6h between races pays a full TCP+TLS handshake (~200-500ms). We can't
+// afford that in the fire path. Bumping to 10 min holds the pool through the
+// pre-warm → fire window; connections are lightweight to hold open.
+setGlobalDispatcher(new Agent({
+  keepAliveTimeout: 10 * 60 * 1000,
+  keepAliveMaxTimeout: 30 * 60 * 1000,
+  pipelining: 1,
+  connect: { timeout: 10_000 },
+}));
 
 // Single-instance guard. Task Scheduler's IgnoreNew doesn't work when the
 // scheduled task is a launcher that exits immediately (wscript forks cmd/node
@@ -170,6 +183,38 @@ async function arboxBook(session, wl, packageId, scheduleId) {
   return { ok: r.ok, status: r.status, body, text };
 }
 
+// Warm the TCP+TLS connection to Arbox just before the race so the actual
+// POST reuses the socket with zero handshake overhead. Uses the lightest
+// authenticated endpoint we have — the getUserProfile GET returns fast and
+// keeps the connection pooled for the imminent POST.
+async function prewarmArboxConnection(session, wl) {
+  try {
+    await fetch(`${ARBOX}/api/v2/user/getUserProfile`, { method: 'GET', headers: authHeaders(session, wl) });
+  } catch {}
+}
+
+// Fire 3 POSTs in parallel. The first successful response wins; the others
+// arrive at Arbox as "already booked" no-ops. Same shape as the CF Worker's
+// burstFire — helps when a single POST would fall in the slow tail of a
+// long-tailed response-time distribution (~900ms Mon 07-27, killing Liron's race).
+// Retries once immediately on 514 (Arbox's overload signal at peak race moments).
+async function burstBook(session, wl, packageId, scheduleId) {
+  const oneShot = async () => {
+    let res = await arboxBook(session, wl, packageId, scheduleId);
+    if (res.status === 514) res = await arboxBook(session, wl, packageId, scheduleId);
+    return res;
+  };
+  // Small staggering so we don't hit Arbox with 3 packets in the same μs
+  // (which historically triggered 429 rate limits on the CF Worker).
+  const results = await Promise.all([
+    oneShot(),
+    new Promise(r => setTimeout(() => r(oneShot()), 20)),
+    new Promise(r => setTimeout(() => r(oneShot()), 40)),
+  ]);
+  const ok = results.find(r => r.ok);
+  return ok || results[0];
+}
+
 // ============================================================================
 // Timezone helpers — mirror the CF Worker exactly so opens_at math matches
 // ============================================================================
@@ -293,13 +338,20 @@ async function scheduleRaceFire(chatId, user, rule) {
       return;
     }
 
+    // Prewarm the TCP+TLS connection ~500ms before opens_at so the real POST
+    // is a keep-alive reuse (0-RTT for TCP, 0 handshake for TLS).
+    const prewarmAt = occ.opensAtMs - 500;
+    const untilPrewarm = prewarmAt - Date.now();
+    if (untilPrewarm > 0) await precisionSleep(untilPrewarm);
+    prewarmArboxConnection(session, session.wl).catch(() => {});
+
     // Precision-wait to opens_at.
     const remain = occ.opensAtMs - Date.now();
     await precisionSleep(remain);
 
-    // FIRE.
+    // FIRE — burst 3 parallel POSTs, retry each on 514.
     const t0 = performance.now();
-    const res = await arboxBook(session, session.wl, session.packageId, klass.id);
+    const res = await burstBook(session, session.wl, session.packageId, klass.id);
     const elapsedMs = performance.now() - t0;
     const arrivalOffset = Date.now() - occ.opensAtMs;
     log(`[${chatId}][${rule.id}] FIRED — arrived T+${arrivalOffset}ms, rt=${elapsedMs.toFixed(0)}ms, http=${res.status}`);
